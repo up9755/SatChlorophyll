@@ -1,0 +1,2069 @@
+---
+title: "Joining in-situ data with satellite data"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+### 1. Setup
+
+#### 1.1. Loading libraries
+```{r library_load, message=FALSE}
+# loads libraries
+# if a library is not installed, use: install.packages("<package_name>")
+library(tidyverse)
+library(ncdf4)
+library(Metrics)
+library(caret)
+library(beepr)
+library(scales)
+library(plotrix)
+library(latex2exp)
+```
+
+#### 1.2 User settings
+```{r user_settings}
+time_start <- proc.time()
+
+# set to TRUE if you have bathymetry data available, otherwise set to FALSE
+setting_situ_floor_depth_use = TRUE
+
+# limit the depth of the ocean floor (lower bound, upper bound)
+#setting_situ_floor_depth_limit <- c(-Inf, -20) # at or below 20m
+#setting_situ_floor_depth_limit <- c(-Inf, -10) # at or below 10m
+setting_situ_floor_depth_limit <- c(-Inf, 0) # any depth
+
+# which sampling method to use
+# options are:
+#   "BILIN_NAIVE": naive bilinear interpolation (least valid joins between data)
+#   "NN": nearest neighbour
+#   "BILIN_ADVANCED": advanced bilinear interpolation (most valid joins between data), naive + processing some null values
+#setting_matchup_sampling_method <- "BILIN_NAIVE"
+#setting_matchup_sampling_method <- "NN"
+setting_matchup_sampling_method <- "BILIN_ADVANCED"
+
+# limit the longitude and latitude (filter data beforehand)
+setting_limit_lon_min <- 11.8
+setting_limit_lon_max <- 19.7
+setting_limit_lat_min <- 39.9
+setting_limit_lat_max <- 45.9
+
+# remove in-situ measurements that have their quality lower than the specified threshold
+# can be set to NA to ignore condition
+setting_situ_min_quality_threshold <- 0
+
+# what difference in time is still considered to be a match between in-situ and satellite data
+setting_day_width_interval <- 1 # one day
+# offset for where to center the interval
+setting_day_offset_interval <- 0.5 # mid-day (noon)
+
+# limit the processed in-situ data to only those with these file marks (empty list processes all)
+# file marks are specified in the "filelist.txt" file and taken into account before the in-situ data is parsed with the Python script
+setting_acceptable_file_mark_list <- c(
+  #"filemarkname1",
+  #"filemarkname2",
+  #"filemarkname3"
+)
+
+
+# paths to files or directories
+
+# path to in-situ data (file)
+path_to_in_situ <- "../../data/situ/situ.csv"
+# path to satellite folder containing the files (without "/" character)
+path_to_sat <- "../../data/sat"
+
+# individual satellite data file names
+filenames <- c(
+  "REP_L3_2010_H1.nc",
+  "REP_L3_2010_H2.nc",
+  "REP_L3_2011_H1.nc",
+  "REP_L3_2011_H2.nc",
+  "REP_L3_2012_H1.nc",
+  "REP_L3_2012_H2.nc",
+  "REP_L3_2013_H1.nc",
+  "REP_L3_2013_H2.nc",
+  "REP_L3_2014_H1.nc",
+  "REP_L3_2014_H2.nc",
+  "REP_L3_2015_H1.nc",
+  "REP_L3_2015_H2.nc",
+  "REP_L3_2016_H1.nc",
+  "REP_L3_2016_H2.nc",
+  "REP_L3_2017_H1.nc",
+  "REP_L3_2017_H2.nc",
+  "REP_L3_2018_H1.nc",
+  "REP_L3_2018_H2.nc",
+  "REP_L3_2019_H1.nc",
+  "REP_L3_2019_H2.nc",
+  "REP_L3_2020_H1.nc",
+  "REP_L3_2020_H2.nc",
+  "REP_L3_2021_H1.nc"
+)
+
+# path to the final data frame (containing joined data)
+filepath_to_joined_data = "data/joined_data.rds" # serialized joined data
+filepath_to_joined_data_csv = "data/joined_data.csv"
+
+# paths to each of the bathymetry files (if available)
+filepath_to_bathymetry_depth = "../../data/bathymetry/bathy_h.ascii"
+filepath_to_bathymetry_lat = "../../data/bathymetry/bathy_lat.ascii"
+filepath_to_bathymetry_lon = "../../data/bathymetry/bathy_lon.ascii"
+
+```
+
+
+#### 1.3. Defining variables
+```{r variable_definition}
+
+# lower difference in time between in-situ and satellite data
+time_epsilon_low <- setting_day_offset_interval - setting_day_width_interval / 2
+# upper difference in time between in-situ and satellite data
+time_epsilon_high <- setting_day_offset_interval + setting_day_width_interval / 2
+
+# sampling method specification
+setting_matchup_bilinear_interpolation <- setting_matchup_sampling_method != "NN"
+setting_matchup_process_na <- setting_matchup_sampling_method == "BILIN_ADVANCED"
+
+try(silent = TRUE, dir.create("data"))
+
+```
+
+#### 1.4. Defining functions
+```{r function_definition}
+get_sat_data <- function(filepath) {
+  nc_file = ncdf4::nc_open(filepath)
+  nc_data_lon = rep(nc_file$var$CHL$dim[[1]]$vals)
+  nc_data_lat = rep(nc_file$var$CHL$dim[[2]]$vals)
+  time_origin = parse_datetime("1981-01-01")
+  nc_data_time = as.POSIXct.numeric(rep(nc_file$var$CHL$dim[[3]]$vals), tz = "UTC", origin = time_origin)
+  nc_data = ncdf4::ncvar_get(nc_file, varid = "CHL")
+  return_list = list(
+    "data" = nc_data,
+    "lon" = nc_data_lon,
+    "lat" = nc_data_lat,
+    "time" = nc_data_time
+  )
+  if (nc_file$nvars > 1) {
+    nc_quality = ncdf4::ncvar_get(nc_file, varid = "QI")
+    return_list$quality = nc_quality
+  }
+  ncdf4::nc_close(nc_file)
+  return(return_list)
+}
+
+# convenience function for formatting numbers (used in printing the stat measurements into a table)
+pprec <- function(value, decimal_places = 0, prepend = "", append = "") {
+  return(
+    str_c(
+      prepend,
+      format(round(value, decimal_places), nsmall = decimal_places),
+      append
+    )
+  )
+}
+
+# calculate the air distance between two points given in degrees (lon, lat)
+# works well for small distances
+lon_lat_to_dist <- function(lon1, lat1, lon2, lat2, R = 6370e3) {
+  dist_deg_lon = lon2 - lon1
+  avrg_deg_lon = (lon1 + lon2) / 2
+  dist_deg_lat = (lat2 - lat1) * cos(avrg_deg_lon * pi / 180)
+  dist_lon = dist_deg_lon * R * pi / 180
+  dist_lat = dist_deg_lat * R * pi / 180
+  dist = sqrt(dist_lon^2 + dist_lat^2)
+  return(dist)
+}
+
+# iteratively improves the accuracy (minimizes the distance)
+situ_sat_matchup_improve <- function(
+  lon_sat, lat_sat,
+  lon_situ, lat_situ,
+  lon_i, lat_i,
+  triangulate = TRUE,
+  step_limit = -1
+) {
+  # lon_sat = an array of possible satellite longitude values, ordered in sequence
+  # lat_sat = an array of possible satellite latitude values, ordered in sequence
+  # lon_situ = actual longitude of the measurement, expressed in degrees longitude
+  # lat_situ = actual latitude of the measurement, expressed in degrees latitude
+  # lon_i = initial estimated best match index of lon_sat
+  # lat_i = initial estimated best match index of lat_sat
+  lon_c = lon_i # current longitude equals initial longitude
+  lat_c = lat_i # current latitude equals initial latitude
+  step = 0
+  while (step != step_limit) {
+    lon_l = lon_c - 1 # longitude lower
+    lon_u = lon_c + 1 # longitude upper
+    lat_l = lat_c - 1 # latitude lower
+    lat_u = lat_c + 1 # latitude upper
+    dist = lon_lat_to_dist(lon_situ, lat_situ, lon_sat[lon_c], lat_sat[lat_c]) # actual distance
+    dist_lon_l = lon_lat_to_dist(lon_situ, lat_situ, lon_sat[lon_l], lat_sat[lat_c])
+    dist_lon_u = lon_lat_to_dist(lon_situ, lat_situ, lon_sat[lon_u], lat_sat[lat_c])
+    dist_lat_l = lon_lat_to_dist(lon_situ, lat_situ, lon_sat[lon_c], lat_sat[lat_l])
+    dist_lat_u = lon_lat_to_dist(lon_situ, lat_situ, lon_sat[lon_c], lat_sat[lat_u])
+    # find direction with minimum distance
+    direction_list = c("", "lon_l", "lon_u", "lat_l", "lat_u")
+    min_index_value = min_index(
+      c(
+        dist,
+        dist_lon_l,
+        dist_lon_u,
+        dist_lat_l,
+        dist_lat_u
+      )
+    )
+    direction = direction_list[min_index_value]
+    # get the new index
+    lon_n = lon_c + c(0, -1, 1,  0, 0)[min_index_value]
+    lat_n = lat_c + c(0,  0, 0, -1, 1)[min_index_value]
+    if (min_index_value == "") {
+      # we are already in the optimal point
+      if (!triangulate) {
+        # return the current minimum point
+        return(c(lon_n, lat_n, step))
+      }
+      # triangulate the exact point
+      # find next closest point in each direction
+      lon_upper = dist_lon_u > dist_lon_l
+      lat_upper = dist_lat_u > dist_lat_l
+    }
+    else {
+      # another optimization step
+      lon_c = lon_n
+      lat_c = lat_n
+      step = step + 1
+    }
+  }
+  
+}
+
+# finds the minimum value in a list and returns its index
+min_index <- function(array) {
+  index = 0
+  minimum = Inf
+  for (i in seq_along(array)) {
+    val = array[[i]]
+    if (val < minimum) {
+      minimum = val
+      index = i
+    }
+  }
+  return(index)
+}
+
+# find the exact point in an array with bisection
+bisect_find <- function(array, val, interpolate = FALSE, step_limit = -1) {
+  ln = length(array)
+  l = 1 # left point
+  r = ln # right point
+  lv = array[l] # left value
+  rv = array[r] # right value
+  if (val < lv | val > rv) {
+    return(-1)
+  }
+  cp = NaN # center point (previous)
+  step = 0
+  while (step_limit != step) {
+    c = (l + r) %/% 2 # center point
+    cv = array[c] # center value
+    #print(str_c("l = ", l, " (", lv, "), c = ", c, " (", cv, "), r = ", r, " (", rv, "), step = ", step))
+    if (val < cv) {
+      r = c # go into left half, set right point to the center point
+    }
+    else {
+      l = c # go into right half, set left point to the center point
+    }
+    # terminating condition check
+    if (c == cp & !is.na(cp)) {
+      break
+    }
+    lv = array[l]
+    rv = array[r]
+    cp = c
+    step = step + 1
+  }
+  if (cv == val) {
+    return
+  }
+  alpha = (val - lv) / (rv - lv)
+  if (interpolate) {
+    return (c + alpha)
+  }
+  if (alpha > 0.5) {
+    c = c + 1
+  }
+  return(c)
+}
+
+bilinear_interpolation <- function(array, a, b, process_na = TRUE, do_nn = FALSE) {
+  # array = a 2D array of values
+  # a = decimal index value along the first dimension of the array
+  # b = decimal index value along the second dimension of the array
+  # process_na = if some of the values to be interpolated are NA, use nearest available
+  # do_nn = if TRUE, don't do any interpolation, instead return nearest value
+  
+  # get index values and alphas
+  a_whole = as.integer(a) - (a < 0) + (a == as.integer(a))
+  a_fract = a %% 1
+  b_whole = as.integer(b) - (b < 0) + (b == as.integer(b))
+  b_fract = b %% 1
+  
+  len_x = dim(array)[1]
+  len_y = dim(array)[2]
+  
+  if (do_nn) {
+    a_whole = a_whole + (a_fract > 0.5)
+    b_whole = b_whole + (b_fract > 0.5)
+    if (!(a_whole > 0 & a_whole <= len_x & b_whole > 0 & b_whole <= len_y)) {
+      return(NA)
+    }
+    return(array[a_whole, b_whole])
+  }
+  
+  p11 = NA
+  if (a_whole > 0 & a_whole <= len_x & b_whole > 0 & b_whole <= len_y) {
+    p11 = array[a_whole    , b_whole    ]
+  }
+  p12 = NA
+  if (a_whole > 0 & a_whole <= len_x & (b_whole + 1) > 0 & (b_whole + 1) <= len_y) {
+    p12 = array[a_whole    , b_whole + 1]
+  }
+  p21 = NA
+  if ((a_whole + 1) > 0 & (a_whole + 1) <= len_x & b_whole > 0 & b_whole <= len_y) {
+    p21 = array[a_whole + 1, b_whole    ]
+  }
+  p22 = NA
+  if ((a_whole + 1) > 0 & (a_whole + 1) <= len_x & (b_whole + 1) > 0 & (b_whole + 1) <= len_y) {
+    p22 = array[a_whole + 1, b_whole + 1]
+  }
+  
+  n11 = is.na(p11)
+  n12 = is.na(p12)
+  n21 = is.na(p21)
+  n22 = is.na(p22)
+  
+  
+  na_count = sum(c(n11, n12, n21, n22))
+  
+  
+  if (na_count > 0 & !process_na) {
+    # some points don't have a value and process_na is not requested
+    return(NA)
+  }
+  
+  
+  if (na_count == 1) {
+    # only one point doesn't have a value, reflect the value of the opposite point to this one
+    if (n11) {
+      #p11 = (p12 + p21) - p22
+      p11 = (p12 + p21) / 2
+      n11 = is.na(p11)
+    }
+    else if (n12) {
+      #p12 = (p11 + p22) - p21
+      p12 = (p11 + p22) / 2
+      n12 = is.na(p12)
+    }
+    else if (n21) {
+      #p21 = (p11 + p22) - p12
+      p21 = (p11 + p22) / 2
+      n21 = is.na(p21)
+    }
+    else if (n22) {
+      #p22 = (p12 + p21) - p11
+      p22 = (p12 + p21) / 2
+      n22 = is.na(p22)
+    }
+    na_count = sum(c(n11, n12, n21, n22))
+    if (na_count > 0) {
+      return(NA)
+    }
+  }
+  
+  
+  if (na_count == 0) {
+    # full bilinear interpolation
+    # one direction
+    edgeW = p11 * (1 - a_fract) + p21 * a_fract
+    edgeE = p12 * (1 - a_fract) + p22 * a_fract
+    bilin1 = edgeW * (1 - b_fract) + edgeE * b_fract
+    # other direction
+    edgeS = p11 * (1 - b_fract) + p12 * b_fract
+    edgeN = p21 * (1 - b_fract) + p22 * b_fract
+    bilin2 = edgeS * (1 - a_fract) + edgeN * a_fract
+    # average of the two
+    res = (bilin1 + bilin2) / 2
+    return(res)
+  }
+  
+  
+  if (na_count == 2) {
+    # two points with missing values
+    if ((n11 & n22) | (n21 & n12)) {
+      # two opposite points with missing values, two opposite points with values
+      if (n11 & n22) {
+        # NW-SE diagonal
+        fract = ( a_fract + (1 - b_fract)) / 2
+        res = p12 * (1 - fract) + p21 * fract
+        return(res)
+      }
+      else if (n12 & n21) {
+        # NW-SE diagonal
+        fract = (a_fract + b_fract) / 2
+        res = p11 * (1 - fract) + p22 * fract
+        return(res)
+      }
+      else {
+        return(NA)
+      }
+    }
+    else {
+      # two adjacent points with missing values, two adjacent points with values
+      # find the available edge, interpolate along it
+      if (n11 & n12) {
+        # north edge
+        res = p21 * (1 - b_fract) + p22 * b_fract
+        return(res)
+      }
+      else if (n21 & n22) {
+        # south edge
+        res = p11 * (1 - b_fract) + p12 * b_fract
+        return(res)
+      }
+      else if (n11 & n21) {
+        # east edge
+        res = p12 * (1 - a_fract) + p22 * a_fract
+        return(res)
+      }
+      else if (n12 & n22) {
+        # east edge
+        res = p11 * (1 - a_fract) + p21 * a_fract
+        return(res)
+      }
+      else {
+        return(NA)
+      }
+    }
+  }
+  
+  
+  if (na_count == 3) {
+    # only a single point has a value, use this point
+    if (!n11) {
+      return(p11)
+    }
+    if (!n12) {
+      return(p12)
+    }
+    if (!n21) {
+      return(p21)
+    }
+    if (!n22) {
+      return(p22)
+    }
+  }
+  
+  
+  return(NA)
+}
+
+if_then_else <- function(condition, true_value, false_value) {
+  # function returns true_value if condition is TRUE, otherwise returns false_value
+  if (condition) {
+    return(true_value)
+  }
+  return(false_value)
+}
+
+isnull <- function(value, replacement) {
+  # if input value is null (is.na(value) returns TRUE), returns the replacement instead of input value
+  return(if_then_else(is.na(value), replacement, value))
+}
+
+# returns TRUE if the iterable contains the argument, FALSE otherwise
+contains <- function(iterable, argument) {
+  for(element in iterable) {
+    if (isnull(element == argument, FALSE)) {
+      return (TRUE)
+    }
+  }
+  return (FALSE)
+}
+
+pearson_sample_correlation <- function(X, Y) {
+  lX = length(X)
+  lY = length(Y)
+  if (lX != lY) {
+    return (NA)
+  }
+  mX = sum(X) / lX
+  mY = sum(Y) / lY
+  top = sum((X - mX) * (Y - mY))
+  sX = sqrt(sum((X - mX)^2))
+  sY = sqrt(sum((Y - mY)^2))
+  return (top / (sX * sY))
+}
+
+binom <- function(n, k) {
+  if (n < 1 || k < 1 || n < k) {
+    return (NA)
+  }
+  return (factorial(n) / (factorial(k) * factorial(n - k)))
+}
+
+kendall_correlation <- function(X, Y) {
+  lX = length(X)
+  lY = length(Y)
+  if (lX != lY || lX < 2) {
+    return (NA)
+  }
+  # https://en.wikipedia.org/wiki/Kendall_rank_correlation_coefficient#Algorithms
+  numer = 0
+  n_concordant = 0
+  n_discordant = 0
+  for (i in 2:lX) {
+    for (j in 1:(i-1)) {
+      concordance = sign(X[i] - X[j]) * sign(Y[i] - Y[j])
+      numer = numer + concordance
+      #n_concordant = n_concordant + (concordance ==  1)
+      #n_discordant = n_discordant + (concordance == -1)
+    }
+  }
+  n_combinations = lX * (lX - 1) / 2
+  return (numer / n_combinations)
+}
+
+
+# reads a bathymetry file
+read_bathymetry_file <- function(filepath) {
+  
+  raw_data <- readLines(filepath)
+  
+  height <- length(raw_data)
+  width <- str_count(raw_data[1], "\t") + 1
+  
+  string_elements <- str_split_fixed(raw_data, "\t", n = width)
+  string_elements_1d <- rep(string_elements)
+  values_1d <- parse_number(string_elements_1d, na = c("", "NA", "NaN"))
+  values <- array(values_1d, c(height, width))
+  
+  return(values)
+  
+}
+```
+
+
+### 2. Reading and processing the in-situ data
+
+#### 2.1. Reading the in-situ data
+```{r read_in-situ_data, message=FALSE}
+df_situ_raw <- read.csv(path_to_in_situ)
+
+df_situ_full <- df_situ_raw %>%
+  mutate(
+    cap_date = parse_datetime(date_time),
+    id = file_id,
+    sub_id = seq_in,
+    seq = seq_all,
+    is_exact_date = exact_datetime == "Y",
+    chl_a = chl
+  ) %>%
+  filter(
+    !is.na(chl_a),
+    !is.na(cap_date),
+    chl_a < 70,
+    lon >= setting_limit_lon_min,
+    lon <= setting_limit_lon_max,
+    lat >= setting_limit_lat_min,
+    lat <= setting_limit_lat_max,
+    is.na(setting_situ_min_quality_threshold) | quality >= setting_situ_min_quality_threshold,
+    length(setting_acceptable_file_mark_list) == 0 | toupper(file_type) %in% toupper(setting_acceptable_file_mark_list)
+  )
+#if (!is.na(setting_acceptable_file_mark)) {
+#  df_situ_full <- df_situ_full %>%
+#    filter(file_type == toupper(setting_acceptable_file_mark))
+#}
+```
+
+#### 2.2. Processing the in-situ data
+```{r process_in-situ_data}
+df_situ <- df_situ_full %>%
+  filter(
+    # only select entries that are within a time range
+    cap_date > parse_datetime("2010-01-01"),
+    cap_date < parse_datetime("2022-01-15")
+  ) %>%
+  # select only the necessary variables and add some new ones
+  transmute(
+    id,
+    sub_id,
+    seq = row_number(),
+    file_type,
+    cap_date,
+    cap_day = difftime(cap_date, parse_datetime("2000-01-01"), tz = "UTC", units = "d"),
+    is_exact_date,
+    actual_depth = parse_number("NA"),
+    lat,
+    lon,
+    chl_a,
+    sat_day = parse_datetime(""),
+    chl_a_sat = parse_number("NA")
+  )
+```
+
+The in-situ data frame contains `r nrow(df_situ)` data points.
+
+```{r}
+# get the actual sea floor depth for each data point
+# bathymetry data has to be available and 'setting_situ_floor_depth_use' has to be TRUE
+
+if (setting_situ_floor_depth_use) {
+  
+  bathy_depth <- read_bathymetry_file(filepath_to_bathymetry_depth)
+  bathy_lat <- read_bathymetry_file(filepath_to_bathymetry_lat)
+  bathy_lon <- read_bathymetry_file(filepath_to_bathymetry_lon)
+  
+  bathy_gradient_lat <- bathy_lat[1, ]
+  bathy_gradient_lon <- bathy_lon[ ,1]
+  
+  bathy_lat_min <- min(bathy_gradient_lat)
+  bathy_lat_max <- max(bathy_gradient_lat)
+  bathy_lon_min <- min(bathy_gradient_lon)
+  bathy_lon_max <- max(bathy_gradient_lon)
+  
+  for (i in 1:nrow(df_situ)) {
+    
+    
+    df_lat <- df_situ$lat[i]
+    df_lon <- df_situ$lon[i]
+    
+    if (
+      is.na(df_lat) | df_lat < bathy_lat_min | df_lat > bathy_lat_max |
+      is.na(df_lon) | df_lon < bathy_lon_min | df_lon > bathy_lon_max
+    ) {
+      next
+    }
+    
+    index_lat <- bisect_find(bathy_gradient_lat, df_lat, interpolate = TRUE)
+    index_lon <- bisect_find(bathy_gradient_lon, df_lon, interpolate = TRUE)
+    
+    value <- bilinear_interpolation(
+      bathy_depth,
+      index_lon,
+      index_lat
+    )
+    
+    df_situ$actual_depth[i] <- value
+  }
+}
+
+```
+
+```{r}
+# filters out data points that are outside of the allowed sea floor depth
+# bathymetry data has to be available and 'setting_situ_floor_depth_use' has to be TRUE
+
+if (setting_situ_floor_depth_use) {
+  
+  df_situ <- df_situ %>%
+    filter(
+      setting_situ_floor_depth_limit[1] == -Inf | actual_depth >= setting_situ_floor_depth_limit[1],
+      setting_situ_floor_depth_limit[2] == Inf | actual_depth <= setting_situ_floor_depth_limit[2]
+    ) %>%
+    mutate(
+      seq = row_number()
+    )
+}
+
+```
+
+
+
+
+### 3. Combining the satellite data with the in-situ data
+```{r combine_satellite_with_in-situ_data}
+# loop through each file containing satellite data
+for (i in seq_along(filenames)) {
+  # name of the current file
+  filename <- filenames[[i]]
+  print(str_c("Satellite file ", filename, ", ", i, "/", length(filenames)))
+  # full path to the current file
+  filepath <- str_c(path_to_sat, "/", filename)
+  
+  # get all the relevant data from the file
+  result <- get_sat_data(filepath)
+  sat_data <- result$data
+  sat_lon <- result$lon
+  sat_lat <- result$lat
+  sat_time <- result$time
+  sat_days <- difftime(sat_time, parse_datetime("2000-01-01"), tz = "UTC", units = "d")
+  sat_QI <- result$quality
+  
+  count = 0
+  
+  # get the in-situ entries for a specific time interval
+  for (sat_day_index in seq_along(sat_days)) {
+    day <- as.integer(sat_days[sat_day_index])
+    # get the satellite data for the current day
+    sat_data_day <- sat_data[,,sat_day_index]
+    sat_QI_day <- if_then_else(is.null(sat_QI), NA, sat_QI[,,sat_day_index])
+    # get only those in-situ entries that match the current day
+    df_situ_day <- df_situ %>%
+      filter(
+        cap_day >= day + time_epsilon_low,
+        cap_day < day + time_epsilon_high
+      ) %>%
+      distinct(
+        cap_date,
+        cap_day,
+        lat,
+        lon,
+        chl_a,
+        .keep_all = TRUE
+      )
+    # loop through the in-situ entries and find the nearest satellite data point
+    for (k in seq_along(df_situ_day$id)) {
+      situ_seq <- df_situ_day$seq[k]
+      situ_lon <- df_situ_day$lon[k]
+      situ_lat <- df_situ_day$lat[k]
+      
+      # find closest point using bisection (also interpolate using sub-point precision)
+      match_lon <- bisect_find(sat_lon, situ_lon, interpolate = TRUE)
+      match_lat <- bisect_find(sat_lat, situ_lat, interpolate = TRUE)
+      if (match_lon == -1 | match_lat == -1) {
+        # match not found, skip this in-situ data point
+        print(str_c("Point on day ", k, " skipped, situ_lon = ", situ_lon, ", situ_lat = ", situ_lat, "."))
+        next
+      }
+      
+      # bilinear interpolation
+      interp_sat <- bilinear_interpolation(
+        sat_data_day,
+        match_lon,
+        match_lat,
+        process_na = setting_matchup_process_na,
+        do_nn = !setting_matchup_bilinear_interpolation
+      )
+      # save the point if it has value and is closer in time than a potentially already joined value
+      if (!is.na(interp_sat)) {
+        if (is.na(df_situ$chl_a_sat[situ_seq])) {
+          # value doesn't exist yet, insert it
+          df_situ$chl_a_sat[situ_seq] <- interp_sat
+          df_situ$sat_day[situ_seq] <- sat_time[sat_day_index]
+        }
+        else {
+          # value already exists, insert only if current point is closer in time
+          datetime_in <- df_situ$sat_day[situ_seq] + setting_day_offset_interval * 60 * 60 * 24
+          datetime_new <- sat_time[sat_day_index] + setting_day_offset_interval * 60 * 60 * 24
+          datetime_cap <- df_situ_day$cap_date[k]
+          dist_datetime_in <- abs(difftime(datetime_in, datetime_cap))
+          dist_datetime_new <- abs(difftime(datetime_new, datetime_cap))
+          
+          if (is.na(datetime_in) || (dist_datetime_new < dist_datetime_in)) {
+            # insert new value
+            df_situ$chl_a_sat[situ_seq] <- interp_sat
+            df_situ$sat_day[situ_seq] <- sat_time[sat_day_index]
+          } 
+        }
+      }
+      
+      count = count + 1
+    }
+  }
+}
+```
+
+
+### 4. Cleaning final data
+
+#### 4.1. Removing entries with no chl-a predictions from satellites
+```{r filter_final_data}
+df_situ_final <- df_situ %>%
+  filter(
+    !is.na(chl_a_sat)
+  ) %>%
+  mutate(
+    seq = row_number()
+  ) %>%
+  select(id, seq, file_type, cap_date, actual_depth:chl_a_sat)
+```
+
+
+There are `r nrow(df_situ_final)` out of `r nrow(df_situ)` (`r 100 * nrow(df_situ_final) / nrow(df_situ)`%) data points with corresponding satellite data.
+
+
+### 5. Saving data
+```{r save_final_data}
+# save in RDS format to preserve custom settings
+saveRDS(df_situ_final, filepath_to_joined_data)
+write.csv2(df_situ_final, filepath_to_joined_data_csv)
+```
+
+```{r load_final_data}
+# read back into a tibble
+df_joined_data <- readRDS(filepath_to_joined_data)
+```
+
+
+### 6. Calculating the predictive accuracy of the model
+```{r}
+# Create a data frame containing only non-NA values from the satellite
+df_SAT <- df_joined_data %>%
+  filter(
+    !is.na(chl_a),
+    !is.na(chl_a_sat)
+  ) %>%
+  transmute(
+    seq,
+    actu = chl_a,
+    pred = chl_a_sat
+  )
+```
+
+
+
+
+#### 6.1. Basic statistical measurements
+```{r basic_predictive_accuracy}
+
+# number of measurements
+stat_COUNT <- as.numeric(nrow(df_SAT))
+
+# arithmetic average value
+stat_AVG_actu <- sum(df_SAT$actu) / stat_COUNT
+stat_AVG_pred <- sum(df_SAT$pred) / stat_COUNT
+
+# geometric average value
+stat_AVG_GEOM_actu <- exp(sum(log(df_SAT$actu)) / stat_COUNT)
+stat_AVG_GEOM_pred <- exp(sum(log(df_SAT$pred)) / stat_COUNT)
+
+# MAE - mean absolute error
+stat_MAE <- Metrics::mae(df_SAT$actu, df_SAT$pred)
+stat_MAE_ARIT <- Metrics::mae(df_SAT$actu, df_SAT$pred * (stat_AVG_actu / stat_AVG_pred))
+stat_MAE_GEOM <- Metrics::mae(df_SAT$actu, df_SAT$pred * (stat_AVG_GEOM_actu / stat_AVG_GEOM_pred))
+
+# MSE - mean square error
+stat_MSE <- Metrics::mse(df_SAT$actu, df_SAT$pred)
+stat_MSE_ARIT <- Metrics::mse(df_SAT$actu, df_SAT$pred * (stat_AVG_actu / stat_AVG_pred))
+stat_MSE_GEOM <- Metrics::mse(df_SAT$actu, df_SAT$pred * (stat_AVG_GEOM_actu / stat_AVG_GEOM_pred))
+
+# RMSE - root mean square error
+stat_RMSE <- Metrics::rmse(df_SAT$actu, df_SAT$pred)
+stat_RMSE_ARIT <- Metrics::rmse(df_SAT$actu, df_SAT$pred * (stat_AVG_actu / stat_AVG_pred))
+stat_RMSE_GEOM <- Metrics::rmse(df_SAT$actu, df_SAT$pred * (stat_AVG_GEOM_actu / stat_AVG_GEOM_pred))
+
+# R-squared
+stat_R2 <- caret::R2(df_SAT$actu, df_SAT$pred)
+
+# R - correlation coefficient
+stat_R_pearson  <- cor(df_SAT$actu, df_SAT$pred, method = "pearson")
+stat_R_spearman <- cor(df_SAT$actu, df_SAT$pred, method = "spearman")
+stat_R_kendall  <- cor(df_SAT$actu, df_SAT$pred, method = "kendall")
+
+# R-squared (of log)
+stat_R2_log <- caret::R2(log(df_SAT$actu), log(df_SAT$pred))
+
+# R - correlation coefficient (of log)
+stat_R_log_pearson  <- cor(log(df_SAT$actu), log(df_SAT$pred), method = "pearson")
+stat_R_log_spearman <- cor(log(df_SAT$actu), log(df_SAT$pred), method = "spearman")
+
+
+time_end <- proc.time()
+time_diff <- time_end - time_start
+```
+
+Output:
+
+```{r}
+df_stat_table <- tribble(
+  ~`Statistical indicator`, ~`Value`,
+  #------------------------------
+  "Number of measurements", pprec(stat_COUNT),
+  "Arithmetic mean (in-situ)", pprec(stat_AVG_actu, 3),
+  "Arithmetic mean (satellite)", pprec(stat_AVG_pred, 3),
+  "Geometric mean (in-situ)", pprec(stat_AVG_GEOM_actu, 3),
+  "Geometric mean (satellite)",  pprec(stat_AVG_GEOM_pred, 3),
+  "MAE", pprec(stat_MAE, 3),
+  "MAE (arit. mean adjusted)", pprec(stat_MAE_ARIT, 3),
+  "MAE (geom. mean adjusted)", pprec(stat_MAE_GEOM, 3),
+  "MSE", pprec(stat_MSE, 3),
+  "MSE (arit. mean adjusted)", pprec(stat_MSE_ARIT, 3),
+  "MSE (geom. mean adjusted)", pprec(stat_MSE_GEOM, 3),
+  "RMSE", pprec(stat_RMSE, 3),
+  "RMSE (arit. mean adjusted)", pprec(stat_RMSE_ARIT, 3),
+  "RMSE (geom. mean adjusted)", pprec(stat_RMSE_GEOM, 3),
+  "R-squared", pprec(stat_R2, 4),
+  "R (pearson)", pprec(stat_R_pearson, 4),
+  "R (spearman)", pprec(stat_R_spearman, 4),
+  "R (kendall)", pprec(stat_R_kendall, 4),
+  "R-squared (log)", pprec(stat_R2_log, 4),
+  "R (pearson) (log)", pprec(stat_R_log_pearson, 4),
+  "R (spearman) (log)", pprec(stat_R_log_spearman, 4)
+)
+knitr::kable(df_stat_table)
+
+result_text_time <- str_c("Time:\n",
+  "  User:    ", pprec(time_diff[1], 2, "", "ms"), "\n",
+  "  System:  ", pprec(time_diff[2], 2, "", "ms"), "\n",
+  "  Elapsed: ", pprec(time_diff[3], 2, "", "ms")
+)
+
+o_w_t <- 35 # option width text
+o_w_v <-  7 # option justify value
+o_j_t <- "right"  # option justify text
+o_j_v <- "right"  # option justify value
+o_j_h <- "right" # option justify header
+chr <- "=" # character used for splitting the header and values
+
+result_text_stats <- str_c(
+  str_c(format("Statistical indicator",            width=o_w_t, justify=o_j_t), " ", format("Value",                             width=o_w_v, justify=o_j_h)),
+  str_c(str_pad("",                                width=o_w_t, pad = chr    ), chr, str_pad("",                                 width=o_w_v, pad = chr    )),
+  str_c(format("Number of measurements:",          width=o_w_t, justify=o_j_t), " ", format(pprec(stat_COUNT),                   width=o_w_v, justify=o_j_v)),
+  str_c(format("Arithmetic mean (in-situ):",       width=o_w_t, justify=o_j_t), " ", format(pprec(stat_AVG_actu, 3),             width=o_w_v, justify=o_j_v)),
+  str_c(format("Arithmetic mean (satellite):",     width=o_w_t, justify=o_j_t), " ", format(pprec(stat_AVG_pred, 3),             width=o_w_v, justify=o_j_v)),
+  str_c(format("Geometric mean (in-situ):",        width=o_w_t, justify=o_j_t), " ", format(pprec(stat_AVG_GEOM_actu, 3),        width=o_w_v, justify=o_j_v)),
+  str_c(format("Geometric mean (satellite):",      width=o_w_t, justify=o_j_t), " ", format(pprec(stat_AVG_GEOM_pred, 3),        width=o_w_v, justify=o_j_v)),
+  str_c(format("MAE:",                             width=o_w_t, justify=o_j_t), " ", format(pprec(stat_MAE, 3),                  width=o_w_v, justify=o_j_v)),
+  str_c(format("MAE (arit. mean adjusted):",       width=o_w_t, justify=o_j_t), " ", format(pprec(stat_MAE_ARIT, 3),             width=o_w_v, justify=o_j_v)),
+  str_c(format("MAE (geom. mean adjusted):",       width=o_w_t, justify=o_j_t), " ", format(pprec(stat_MAE_GEOM, 3),             width=o_w_v, justify=o_j_v)),
+  str_c(format("MSE:",                             width=o_w_t, justify=o_j_t), " ", format(pprec(stat_MSE, 3),                  width=o_w_v, justify=o_j_v)),
+  str_c(format("MSE (arit. mean adjusted):",       width=o_w_t, justify=o_j_t), " ", format(pprec(stat_MSE_ARIT, 3),             width=o_w_v, justify=o_j_v)),
+  str_c(format("MSE (geom. mean adjusted):",       width=o_w_t, justify=o_j_t), " ", format(pprec(stat_MSE_GEOM, 3),             width=o_w_v, justify=o_j_v)),
+  str_c(format("RMSE:",                            width=o_w_t, justify=o_j_t), " ", format(pprec(stat_RMSE, 3),                 width=o_w_v, justify=o_j_v)),
+  str_c(format("RMSE (arit. mean adjusted):",      width=o_w_t, justify=o_j_t), " ", format(pprec(stat_RMSE_ARIT, 3),            width=o_w_v, justify=o_j_v)),
+  str_c(format("RMSE (geom. mean adjusted):",      width=o_w_t, justify=o_j_t), " ", format(pprec(stat_RMSE_GEOM, 3),            width=o_w_v, justify=o_j_v)),
+  str_c(format("R-squared:",                       width=o_w_t, justify=o_j_t), " ", format(pprec(stat_R2, 4),                   width=o_w_v, justify=o_j_v)),
+  str_c(format("R (pearson):",                     width=o_w_t, justify=o_j_t), " ", format(pprec(stat_R_pearson, 4),            width=o_w_v, justify=o_j_v)),
+  str_c(format("R (spearman):",                    width=o_w_t, justify=o_j_t), " ", format(pprec(stat_R_spearman, 4),           width=o_w_v, justify=o_j_v)),
+  str_c(format("R (kendall):",                     width=o_w_t, justify=o_j_t), " ", format(pprec(stat_R_kendall, 4),            width=o_w_v, justify=o_j_v)),
+  str_c(format("R-squared (log):",                 width=o_w_t, justify=o_j_t), " ", format(pprec(stat_R2_log, 4),               width=o_w_v, justify=o_j_v)),
+  str_c(format("R (pearson) (log):",               width=o_w_t, justify=o_j_t), " ", format(pprec(stat_R_log_pearson, 4),        width=o_w_v, justify=o_j_v)),
+  str_c(format("R (spearman) (log):",              width=o_w_t, justify=o_j_t), " ", format(pprec(stat_R_log_spearman, 4),       width=o_w_v, justify=o_j_v)),
+  sep = "\n"
+)
+
+result_text_settings <- str_c(
+  "Settings:\n",
+  "  setting_situ_floor_depth_limit: [", setting_situ_floor_depth_limit[1], ", ", setting_situ_floor_depth_limit[2], "]\n",
+  "  setting_matchup_sampling_method: ", setting_matchup_sampling_method, "\n",
+  "  setting_limit_lon_min: ", setting_limit_lon_min, "\n",
+  "  setting_limit_lon_max: ", setting_limit_lon_max, "\n",
+  "  setting_limit_lat_min: ", setting_limit_lat_min, "\n",
+  "  setting_limit_lat_max: ", setting_limit_lat_max, "\n",
+  "  setting_situ_min_quality_threshold: ", setting_situ_min_quality_threshold, "\n",
+  "  setting_day_width_interval: ", setting_day_width_interval, "\n",
+  "  setting_day_offset_interval: ", setting_day_offset_interval, "\n",
+  "  setting_acceptable_file_mark_list: ", toString(setting_acceptable_file_mark_list), "\n"
+)
+
+result_text <- str_c(
+  Sys.time(),
+  "\n\n",
+  result_text_time,
+  "\n\n",
+  result_text_stats,
+  "\n\n",
+  result_text_settings
+)
+
+result_text_out <- str_c(
+  "\n",
+  str_pad("", 60, pad = "-"),
+  result_text,
+  "\n\n\n"
+)
+
+writeLines(result_text)
+
+write(result_text_out, "results.txt", append = TRUE)
+
+beep()
+```
+
+`MAE` - mean absolute error (same units as input, target = 0)
+
+`MSE` - mean square error (squared input units, target = 0)
+
+`RMSE` - root mean square error (same units as input, target = 0)
+
+`RRSE` - root relative square error (unitless, target = 0)
+
+`SMAPE` - symmetric mean absolute percentage error (percentage units ranges from 0% to 200%, target = 0%)
+
+`R^2`,`R-squared` - coefficient of determination (unitless, ranges from 0 to 1, target = 1)
+
+`R` (pearson, spearman) - correlation coefficient (unitless, ranges from -1 to 1, target = 1, 0 = no correlation, negative = inverse correlation)
+
+Explanations of these (and more) measurements in the `Metrics` library [documentation](https://www.rdocumentation.org/packages/Metrics/versions/0.1.4).
+
+
+
+
+### 7. Visualizing the in-situ and satellite data
+
+#### 7.1. Scatterplot
+```{r visualize_scatterplot fig.asp = 1, fig.width = 6, fig.height = 6}
+
+# execute every time the parameters change (sea floor depth)
+
+# to view the results in the execution window, comment out lines ending in '# COMMENT OUT'
+
+try(silent = TRUE, dir.create("out"))
+try(silent = TRUE, dir.create("out/graphics"))
+try(silent = TRUE, dir.create("out/graphics/scatterplot"))
+
+# ------------------------------------------------------------------------------
+
+graph_name <- "new"
+if (setting_situ_floor_depth_limit[2] < 0) {
+  graph_name <- str_c("new_", -setting_situ_floor_depth_limit[2], "m")
+}
+
+# normal
+plot_scatterplot_result <- # COMMENT OUT
+  df_SAT %>%
+    mutate(
+      `Napovedane vrednosti` = pred,
+      `Prave vrednosti` = actu
+    ) %>%
+    ggplot(aes(`Prave vrednosti`, `Napovedane vrednosti`)) +
+    geom_point(alpha = 0.2) +
+    geom_abline(slope = 1, intercept = 0, color = "#432AEA") +
+    coord_cartesian(c(0, 40), c(0, 40), expand = TRUE) +
+    theme(text=element_text(size=32))
+
+pdf(str_c("out/graphics/scatterplot/result_", graph_name, ".pdf")) # COMMENT OUT
+print(plot_scatterplot_result) # COMMENT OUT
+dev.off() # COMMENT OUT
+
+
+# https://www.statology.org/ggplot2-log-scale/
+
+dim_low <- 10^(-1.9)
+dim_high <- 10^(2.0)
+
+# log
+plot_scatterplot_result_log <- # COMMENT OUT
+  df_SAT %>%
+    mutate(
+      `Napovedane vrednosti` = pred,
+      `Prave vrednosti` = actu
+    ) %>%
+    ggplot(aes(`Prave vrednosti`, `Napovedane vrednosti`)) +
+    geom_point(alpha = 0.2) +
+    geom_abline(slope = 1, intercept = 0, color = "#432AEA") +
+    scale_y_continuous(
+      trans = 'log10',
+      breaks = trans_breaks('log10', function(x) 10^x),
+      labels = trans_format('log10', math_format(10^.x))
+    ) +
+    scale_x_continuous(
+      trans = 'log10',
+      breaks = trans_breaks('log10', function(x) 10^x),
+      labels = trans_format('log10', math_format(10^.x))
+    ) +
+    coord_cartesian(c(dim_low, dim_high), c(dim_low, dim_high), expand = TRUE) +
+    theme(text=element_text(size=32))
+
+pdf(str_c("out/graphics/scatterplot/result_", graph_name, "_log.pdf")) # COMMENT OUT
+print(plot_scatterplot_result_log) # COMMENT OUT
+dev.off() # COMMENT OUT
+
+```
+
+
+```{r fig.asp = 1, fig.width = 6}
+df_joined_data %>%
+  ggplot(aes(lon, lat)) +
+  geom_point() +
+  coord_fixed()
+```
+
+
+```{r, dev = c('png', 'pdf', 'svg'), fig.asp = 1, fig.width = 6}
+
+# testing bilinear interpolation (with NA value handling) - artificial data
+# run multiple times with different sampling methods selected to get all different outputs
+
+# to view the results in the execution window, comment out lines ending in '# COMMENT OUT'
+
+try(silent = TRUE, dir.create("out"))
+try(silent = TRUE, dir.create("out/graphics"))
+try(silent = TRUE, dir.create("out/graphics/bilin_showcase_test_data"))
+
+# ------------------------------------------------------------------------------
+
+res_x = 400
+res_y = 350
+start_x = -0.2
+start_y = -0.2
+stop_x = 9.2
+stop_y = 8.2
+
+# ---------------- #
+
+range_x = stop_x - start_x
+range_y = stop_y - start_y
+step_x = range_x / (res_x - 1)
+step_y = range_y / (res_y - 1)
+
+X = array(
+  c(
+     7,  5,  7,  8,  7, NA, NA,  8,
+    NA,  6, NA,  6, NA,  4,  7,  6,
+     4,  6,  5, NA, NA,  5,  6, NA,
+    10,  4,  2, NA,  4,  3, NA,  6,
+     8,  9,  4,  3,  2, NA,  7,  9,
+    NA, NA,  6,  3,  3, NA, NA,  6,
+    NA, NA, NA,  4, NA, NA, NA,  8
+  ),
+  c(8, 7)
+)
+
+Y = array(1:(res_x*res_y), c(res_x, res_y))
+
+for (x in 1:res_x) {
+  for (y in 1:res_y) {
+    Y[x, y] = bilinear_interpolation(
+      X,
+      start_x + (x - 1) * step_x,
+      start_y + (y - 1) * step_y,
+      process_na = TRUE,
+      do_nn = FALSE
+    )
+  }
+}
+
+heatmap = tibble(z = rep(Y)) %>%
+  mutate(
+    x = (((res_x*res_y):1 - 1) %/% res_x) + 1,
+    y = ((1:(res_x*res_y) - 1)  %% res_x) + 1
+  )
+
+plot_bilin_showcase_test_data <- # COMMENT OUT
+  ggplot(heatmap) +
+  geom_raster((aes(y, x, fill = z))) +
+  coord_fixed() +
+  scale_fill_gradient2(low = "#031033", mid = "#1C677A", high = "#26E0A8", midpoint = 5)
+
+pdf(str_c("out/graphics/bilin_showcase_test_data/", setting_matchup_sampling_method, ".pdf")) # COMMENT OUT
+print(plot_bilin_showcase_test_data) # COMMENT OUT
+dev.off() # COMMENT OUT
+
+```
+
+```{r, dev = c('pdf'), fig.asp = 1, fig.width = 5}
+
+# testing bilinear interpolation (with NA value handling) - real data
+# L4 satellite data required for this, otherwise change 'filename' variable to read L3 satellite data file
+# run multiple times with differenc sampling methods selected to get all different outputs
+
+# to view the results in the execution window, comment out lines ending in '# COMMENT OUT'
+
+try(silent = TRUE, dir.create("out"))
+try(silent = TRUE, dir.create("out/graphics"))
+try(silent = TRUE, dir.create("out/graphics/bilin_showcase_real_data"))
+
+# ------------------------------------------------------------------------------
+
+res_x = 800
+res_y = 800
+start_x = 1
+start_y = 1
+stop_x = 91
+stop_y = 91
+
+# ---------------- #
+
+range_x = stop_x - start_x
+range_y = stop_y - start_y
+step_x = range_x / (res_x - 1)
+step_y = range_y / (res_y - 1)
+
+
+filename <- "REP_L3_2020_H1.nc"
+filename <- "REP_L4_2020.nc"
+filepath <- str_c(path_to_sat, "/", filename)
+result <- get_sat_data(filepath)
+sat_data <- result$data[,,40] # data from 40th day
+
+X = sat_data[210:320, 480:390]
+
+Y = array(1:(res_x*res_y), c(res_x, res_y))
+
+for (x in 1:res_x) {
+  for (y in 1:res_y) {
+    Y[x, y] = bilinear_interpolation(
+      X,
+      start_x + (x - 1) * step_x,
+      start_y + (y - 1) * step_y,
+      process_na = TRUE,
+      do_nn = FALSE
+    )
+  }
+}
+
+heatmap = tibble(z = rep(Y)) %>%
+  mutate(
+    x = (((res_x*res_y):1 - 1) %/% res_x) + 1,
+    y = ((1:(res_x*res_y) - 1)  %% res_x) + 1
+  )
+
+plot_bilin_showcase_real_data <- # COMMENT OUT
+  ggplot(heatmap) +
+  geom_raster((aes(y, x, fill = z))) +
+  coord_fixed() +
+  scale_fill_gradient2(low = "#031033", mid = "#1C677A", high = "#26E0A8", midpoint = 0.5)
+
+pdf(str_c("out/graphics/bilin_showcase_real_data/", setting_matchup_sampling_method, ".pdf")) # COMMENT OUT
+print(plot_bilin_showcase_real_data) # COMMENT OUT
+dev.off() # COMMENT OUT
+```
+
+
+```{r, dev = c('png', 'pdf', 'svg'), fig.asp = 1, fig.width = 20}
+
+# generate bilinear interpolation images (all possible examples)
+
+# to view the results in the execution window, comment out lines ending in '# COMMENT OUT'
+
+try(silent = TRUE, dir.create("out"))
+try(silent = TRUE, dir.create("out/graphics"))
+try(silent = TRUE, dir.create("out/graphics/sampling_method_examples"))
+
+# ------------------------------------------------------------------------------
+
+res_x = 800
+res_y = 800
+start_x = 1
+start_y = 1
+stop_x = 2
+stop_y = 2
+
+# ---------------- #
+
+range_x = stop_x - start_x
+range_y = stop_y - start_y
+step_x = range_x / (res_x - 1)
+step_y = range_y / (res_y - 1)
+
+
+
+a <- list(
+  list(1,1,1,1),
+  list(1,1,0,1),
+  list(1,0,1,1),
+  list(0,0,1,1),
+  list(0,1,0,1),
+  list(0,1,1,0),
+  list(1,0,0,1),
+  list(0,0,1,0)
+)
+
+for (index in 1:length(a)) {
+  
+  q = a[[index]]
+  
+  X = array(
+    c(
+        10,   0, NA, NA,  10,
+         5,   7, NA, NA,   0
+    ),
+    c(5, 2)
+  )
+  
+  if (q[1] == 0) {
+    X[1,1] = NA
+  }
+  if (q[2] == 0) {
+    X[2,1] = NA
+  }
+  if (q[3] == 0) {
+    X[1,2] = NA
+  }
+  if (q[4] == 0) {
+    X[2,2] = NA
+  }
+  
+  Y = array(1:(res_x*res_y), c(res_x, res_y))
+  
+  for (x in 1:res_x) {
+    for (y in 1:res_y) {
+      Y[x, y] = bilinear_interpolation(
+        X,
+        start_x + (x - 1) * step_x,
+        start_y + (y - 1) * step_y,
+        process_na = TRUE
+      )
+    }
+  }
+  
+  heatmap = tibble(z = rep(Y)) %>%
+    mutate(
+      x = (((res_x*res_y):1 - 1) %/% res_x) + 1,
+      y = ((1:(res_x*res_y) - 1)  %% res_x) + 1
+    )
+  
+  # https://www.datanovia.com/en/blog/how-to-save-a-ggplot/
+  
+  
+  file_out_prefix <- "out/graphics/sampling_method_examples/raw_"
+  file_out_suffix <- ".png"
+  file_name <- str_c(
+    if_then_else(q[1]==1,"Y","N"),
+    if_then_else(q[2]==1,"Y","N"),
+    if_then_else(q[3]==1,"Y","N"),
+    if_then_else(q[4]==1,"Y","N")
+  )
+  file_path <- str_c(file_out_prefix, file_name, file_out_suffix)
+  
+  plot_bilin_example <- # COMMENT OUT
+    ggplot(heatmap) +
+      geom_raster((aes(y, x, fill = z))) +
+      coord_fixed() +
+      scale_fill_gradient(low = "#000000", high = "#FFFFFF", limits = c(0, 10))
+  
+  
+  png(file_path) # COMMENT OUT
+  print(plot_bilin_example) # COMMENT OUT
+  dev.off() # COMMENT OUT
+}
+
+
+
+```
+
+
+```{r, dev = c('png', 'pdf', 'svg'), fig.asp = 1, fig.height = 8}
+
+# shows satellite data on a chosen day
+# also shows all joined points on the map
+# L4 data required, otherwise change the 'filename' variable to a L3 satellite file name
+
+try(silent = TRUE, dir.create("out"))
+try(silent = TRUE, dir.create("out/graphics"))
+try(silent = TRUE, dir.create("out/graphics/where_on_map"))
+
+# ------------------------------------------------------------------------------
+
+# final (joined) points
+df_plot_map <- df_joined_data %>%
+  filter(!is.na(chl_a), !is.na(chl_a_sat)) %>%
+  mutate(Globina = c("Plitvo", "Globoko")[(actual_depth <= setting_situ_floor_depth_limit[2]) + 1])
+
+
+filename <- "REP_L4_2019.nc"
+filepath <- str_c(path_to_sat, "/", filename)
+result <- get_sat_data(filepath)
+sat_data <- result$data[,,40]
+sat_lon <- result$lon
+sat_lat <- result$lat
+
+df_heatmap <- tibble(z = rep(sat_data)) %>%
+  mutate(
+    lon = sat_lon[(row_number() %% dim(sat_data)[1]) + 1],
+    lat = sat_lat[(row_number() %/% dim(sat_data)[1]) + 1],
+    `Zemljepisna dolžina` = lon,
+    `Zemljepisna širina` = lat
+  )
+
+# https://stackoverflow.com/questions/21192002/how-to-combine-2-plots-ggplot-into-one-plot
+
+plot_where_on_map <-
+  ggplot() +
+  geom_tile(data = df_heatmap, aes(lon, lat, fill = z)) +
+  labs(x = "Zemljepisna dolžina", y = "Zemljepisna širina") +
+  #scale_fill_viridis_c(option = "F") +
+  scale_fill_gradient2(low = "#031033", mid = "#1C677A", high = "#26E0A8", midpoint = 14) +
+  geom_point(data = df_plot_map, aes(x = lon, y = lat, color = Globina)) +
+  coord_fixed()
+pdf("out/graphics/where_on_map/all_joined.pdf")
+print(plot_where_on_map)
+dev.off()
+
+```
+
+
+```{r, dev = c('png', 'pdf', 'svg'), fig.asp = 1, fig.height = 8}
+
+# show in-situ points on a sea floor depth map
+# mark points as shallow or deep (display in different colors)
+# bathymetry data is required
+
+# to run properly, first set the variable: setting_situ_floor_depth_limit <- c(-Inf, 0)
+# then run the entire process of joining data (this will get all points into memory)
+# then set the variable to the desired depth: setting_situ_floor_depth_limit <- c(-Inf, -20)
+# then run just this block (this will read the current value of setting_situ_floor_depth_limit)
+
+# to view the results in the execution window, comment out lines ending in '# COMMENT OUT'
+
+try(silent = TRUE, dir.create("out"))
+try(silent = TRUE, dir.create("out/graphics"))
+try(silent = TRUE, dir.create("out/graphics/depth_map"))
+
+# ------------------------------------------------------------------------------
+
+every_nth <- 5
+bathy_sparse_depth <- bathy_depth[
+  seq(1, dim(bathy_depth)[1], every_nth),
+  seq(1, dim(bathy_depth)[2], every_nth)
+]
+bathy_sparse_lat <- bathy_lat[
+  seq(1, dim(bathy_lat)[1], every_nth),
+  seq(1, dim(bathy_lat)[2], every_nth)
+]
+bathy_sparse_lon <- bathy_lon[
+  seq(1, dim(bathy_lon)[1], every_nth),
+  seq(1, dim(bathy_lon)[2], every_nth)
+]
+bathy_sparse_gradient_lat <- bathy_sparse_lat[1, ]
+bathy_sparse_gradient_lon <- bathy_sparse_lon[ ,1]
+
+df_heatmap <- tibble(z = rep(bathy_sparse_depth)) %>%
+  mutate(
+    lon = bathy_sparse_gradient_lon[(row_number() %% dim(bathy_sparse_depth)[1]) + 1],
+    lat = bathy_sparse_gradient_lat[(row_number() %/% dim(bathy_sparse_depth)[1]) + 1],
+    `Zemljepisna dolžina` = lon,
+    `Zemljepisna širina` = lat,
+    deep = z <= setting_situ_floor_depth_limit[2],
+    Globina = z
+  )
+
+df_plot_map <- df_joined_data %>%
+  filter(!is.na(chl_a), !is.na(chl_a_sat)) %>%
+  mutate(Globina = c("Plitvo", "Globoko")[(actual_depth <= setting_situ_floor_depth_limit[2]) + 1])
+
+plot_depth_map <- # COMMENT OUT
+  ggplot() +
+  geom_tile(data = df_heatmap, aes(lon, lat, fill = Globina)) +
+  labs(x = "Zemljepisna dolžina", y = "Zemljepisna širina") +
+  scale_fill_gradient2(low = "#031033", mid = "#1C677A", high = "#26E0A8", midpoint = 800) +
+  geom_point(data = df_plot_map, aes(x = lon, y = lat, color = Globina)) +
+  coord_fixed()
+pdf("out/graphics/depth_map/depth_map.pdf") # COMMENT OUT
+print(plot_depth_map) # COMMENT OUT
+dev.off() # COMMENT OUT
+
+```
+
+
+```{r, dev = c('png', 'pdf', 'svg'), fig.asp = 1, fig.height = 8}
+
+# not used in the final result
+
+# to view the results in the execution window, comment out lines ending in '# COMMENT OUT'
+
+try(silent = TRUE, dir.create("out"))
+try(silent = TRUE, dir.create("out/graphics"))
+try(silent = TRUE, dir.create("out/graphics/where_on_map_all"))
+
+# ------------------------------------------------------------------------------
+
+# all points
+df_plot_map <- df_situ_raw %>%
+  filter(!is.na(chl)) %>%
+  distinct(lon, lat)
+
+filename <- "REP_L4_2019.nc"
+filepath <- str_c(path_to_sat, "/", filename)
+result <- get_sat_data(filepath)
+sat_data <- result$data[,,40]
+sat_lon <- result$lon
+sat_lat <- result$lat
+
+df_heatmap <- tibble(z = rep(sat_data)) %>%
+  mutate(
+    lon = sat_lon[(row_number() %% dim(sat_data)[1]) + 1],
+    lat = sat_lat[(row_number() %/% dim(sat_data)[1]) + 1],
+    `Zemljepisna dolžina` = lon,
+    `Zemljepisna širina` = lat,
+    value = c(0.0, 1.0)[2 - is.na(z)]
+  )
+
+plot_where_on_map_all <- # COMMENT OUT
+  ggplot() +
+  geom_tile(data = df_heatmap, aes(lon, lat, fill = value)) +
+  labs(x = "Zemljepisna dolžina", y = "Zemljepisna širina") +
+  geom_point(data = df_plot_map, aes(x = lon, y = lat, color = "#FF0000")) +
+  coord_fixed()
+pdf("out/graphics/where_on_map_all/all_points.pdf") # COMMENT OUT
+print(plot_where_on_map_all) # COMMENT OUT
+dev.off() # COMMENT OUT
+
+```
+
+
+```{r ggplot_heatmap_sat_data, dev = c('png', 'pdf', 'svg'), fig.asp = 1, fig.width = 8}
+
+# satellite data on a chosen day
+# L4 data required, otherwise change the 'filename' variable to an L3 satellite data file name
+
+# to view the results in the execution window, comment out lines ending in '# COMMENT OUT'
+
+try(silent = TRUE, dir.create("out"))
+try(silent = TRUE, dir.create("out/graphics"))
+try(silent = TRUE, dir.create("out/graphics/L4"))
+
+# ------------------------------------------------------------------------------
+
+year <- 2010
+day <- 40
+
+# reading the satellite data and looking at the values
+# defining the filename and filepath
+filename <- str_c("REP_L4_", year, ".nc")
+filepath <- str_c(path_to_sat, "/", filename)
+# getting the data with our previously defined function
+result <- get_sat_data(filepath)
+sat_data <- result$data[,,day] # data from 40th day
+sat_lon <- result$lon
+sat_lat <- result$lat
+# transforming the data so that ggplot can display it as a heat map
+df_heatmap <- tibble(z = rep(sat_data)) %>%
+  mutate(
+    lon = sat_lon[(row_number() %% dim(sat_data)[1]) + 1],
+    lat = sat_lat[(row_number() %/% dim(sat_data)[1]) + 1],
+    Klorofil = z
+  )
+
+# display the data using ggplot2
+
+plot_L4 <- # COMMENT OUT
+df_heatmap %>%
+  ggplot(aes(lon, lat, fill = Klorofil)) +
+  geom_tile() +
+  labs(x = "Zemljepisna dolžina", y = "Zemljepisna širina") +
+  scale_fill_gradient2(low = "#031033", mid = "#1C677A", high = "#26E0A8", midpoint = 6) +
+  coord_fixed()
+pdf("out/graphics/L4/L4.pdf") # COMMENT OUT
+print(plot_L4) # COMMENT OUT
+dev.off() # COMMENT OUT
+write_file(str_c("Satellite data L4 on ", day, ". day of year ", year, "."), "out/graphics/L4/details.txt") # COMMENT OUT
+
+```
+
+
+
+```{r taylor_diagram, dev = c('png', 'pdf', 'svg'), fig.asp = 1, fig.width = 4}
+# Taylor diagram
+
+# run once for all points (don't filter out based on sea floor depth)
+
+try(silent = TRUE, dir.create("out"))
+try(silent = TRUE, dir.create("out/graphics"))
+try(silent = TRUE, dir.create("out/graphics/taylor"))
+
+# ------------------------------------------------------------------------------
+
+# https://www.rdocumentation.org/packages/plotrix/versions/3.8-2/topics/taylor.diagram
+
+df_joined_data_10 <- df_joined_data %>%
+  filter(actual_depth <= -10)
+df_joined_data_20 <- df_joined_data %>%
+  filter(actual_depth <= -20)
+#df_joined_data_30 <- df_joined_data %>%
+#  filter(actual_depth <= -30)
+#df_joined_data_50 <- df_joined_data %>%
+#  filter(actual_depth <= -50)
+
+pdf("out/graphics/taylor/taylor_diagram_20.pdf")
+
+taylor_diagram <- taylor.diagram(
+  ref = df_joined_data$chl_a,
+  model = df_joined_data$chl_a_sat,
+  col = "#7A1A45",
+  pcex = 1.5,
+  normalize = TRUE,
+  main = "Taylorjev diagram",
+  xlab = "Razmerje standardnih odklonov",
+  ylab = "Razmerje RMSE",
+  ngamma = 5
+)
+
+# 10m
+taylor.diagram(
+  ref = df_joined_data_10$chl_a,
+  model = df_joined_data_10$chl_a_sat,
+  col = "#967C16",
+  pcex = 1.5,
+  normalize = TRUE,
+  add = TRUE
+)
+
+# 20m
+taylor.diagram(
+  ref = df_joined_data_20$chl_a,
+  model = df_joined_data_20$chl_a_sat,
+  col = "#1C7F38",
+  pcex = 1.5,
+  normalize = TRUE,
+  add = TRUE
+)
+
+## 30m
+#taylor.diagram(
+#  ref = df_joined_data_30$chl_a,
+#  model = df_joined_data_30$chl_a_sat,
+#  col = "#267C93",
+#  pcex = 1.5,
+#  normalize = TRUE,
+#  add = TRUE
+#)
+#
+## 50m
+#taylor.diagram(
+#  ref = df_joined_data_50$chl_a,
+#  model = df_joined_data_50$chl_a_sat,
+#  col = "#493DA5",
+#  pcex = 1.5,
+#  normalize = TRUE,
+#  add = TRUE
+#)
+
+legend(1.68, 2.23, legend = c(
+  "Vsi podatki",
+  TeX("Globina \\geq 10m"),
+  TeX("Globina \\geq 20m")#,
+  #TeX("Globina \\geq 30m"),
+  #TeX("Globina \\geq 50m")
+#), pch = 19, cex = 1.1, col = c("#7A1A45", "#967C16", "#1C7F38", "#267C93", "#493DA5"))
+), pch = 19, cex = 1.1, col = c("#7A1A45", "#967C16", "#1C7F38"))
+
+par(taylor_diagram)
+
+dev.off()
+
+```
+
+
+
+```{r boxplot, dev = c('png', 'pdf', 'svg'), fig.width = 9, fig.height = 4}
+
+# boxplot
+
+# first run the code (everything up to and including joining data & this block) with ocean depth unrestricted, then with ocean depth restricted (-20m)
+
+# to view the results in the execution window, comment out lines ending in '# COMMENT OUT'
+
+try(silent = TRUE, dir.create("out"))
+try(silent = TRUE, dir.create("out/graphics"))
+try(silent = TRUE, dir.create("out/graphics/boxplot"))
+
+# ------------------------------------------------------------------------------
+
+# this will save all results
+if (setting_situ_floor_depth_limit[2] >= 0) {
+  # unrestricted
+  vec_all_actu <- df_SAT$actu
+  vec_all_pred <- df_SAT$pred
+}
+if (setting_situ_floor_depth_limit[2] < 0) {
+  # restricted
+  vec_deep_actu <- df_SAT$actu
+  vec_deep_pred <- df_SAT$pred
+}
+
+# check if we have all the needed data
+if (all(
+  exists("vec_all_actu"),
+  exists("vec_all_pred"),
+  exists("vec_deep_actu"),
+  exists("vec_deep_pred")
+)) {
+  # calculate and draw the boxplot
+  
+  vec_boxplot_vals <- NULL
+  vec_boxplot_vals <- append(vec_boxplot_vals, vec_all_actu)
+  vec_boxplot_vals <- append(vec_boxplot_vals, vec_all_pred)
+  vec_boxplot_vals <- append(vec_boxplot_vals, vec_deep_actu)
+  vec_boxplot_vals <- append(vec_boxplot_vals, vec_deep_pred)
+  
+  vec_boxplot_marks <- NULL
+  vec_boxplot_marks <- append(vec_boxplot_marks, (1:length(vec_all_actu)) * 0 + 1)
+  vec_boxplot_marks <- append(vec_boxplot_marks, (1:length(vec_all_pred)) * 0 + 2)
+  vec_boxplot_marks <- append(vec_boxplot_marks, (1:length(vec_deep_actu)) * 0 + 3)
+  vec_boxplot_marks <- append(vec_boxplot_marks, (1:length(vec_deep_pred)) * 0 + 4)
+  
+  df_boxplot <- tibble(
+    val = vec_boxplot_vals,
+    grp = vec_boxplot_marks
+  )
+  
+  pdf("out/graphics/boxplot/boxplot.pdf") # COMMENT OUT
+  
+  plot <-  # COMMENT OUT
+    boxplot(
+      val ~ grp,
+      df_boxplot,
+      main = "Grafikon kvantilov", # box plot
+      xlab = "Množica podatkov",
+      ylab = "Koncentracija klorofila",
+      #col = c(), # colors
+      names = c(
+        "Vse globine, in-situ",
+        "Vse globine, satelit",
+        "Samo globoke, in-situ",
+        "Samo globoke, satelit"
+      ),
+      
+      #log = "y" # logarithmic y-scale
+    )
+  print(plot)
+  dev.off() # COMMENT OUT
+  
+}
+
+
+```
+
+
+
+```{r boxplot_advanced, dev = c('png', 'pdf', 'svg'), fig.width = 3, fig.height = 3}
+
+# draw MAE and MSE on a boxplot (average & one standard deviation above and below average)
+
+# run once with all joined data available (no sea floor depth limit)
+
+# to view the results in the execution window, comment out lines ending in '# COMMENT OUT'
+
+try(silent = TRUE, dir.create("out"))
+try(silent = TRUE, dir.create("out/graphics"))
+try(silent = TRUE, dir.create("out/graphics/boxplots"))
+
+# ------------------------------------------------------------------------------
+
+
+stat_plot_width <- 0.8
+
+# function definitions
+
+stat_plot_graph_box_path <- function(stat_plot_avg, stat_plot_dev, index) {
+  
+  stat_plot_width_l <- 0.5 - stat_plot_width / 2
+  stat_plot_width_h <- 0.5 + stat_plot_width / 2
+  
+  stat_plot_height_l <- stat_plot_avg - stat_plot_dev
+  stat_plot_height_m <- stat_plot_avg
+  stat_plot_height_h <- stat_plot_avg + stat_plot_dev
+  
+  df_out <- tibble(
+    xpath = c(
+      index + stat_plot_width_l,
+      index + stat_plot_width_l,
+      index + stat_plot_width_h,
+      index + stat_plot_width_h,
+      index + stat_plot_width_l,
+      index + stat_plot_width_l,
+      index + stat_plot_width_h,
+      index + stat_plot_width_h
+    ),
+    ypath = c(
+      stat_plot_height_m,
+      stat_plot_height_l,
+      stat_plot_height_l,
+      stat_plot_height_m,
+      stat_plot_height_m,
+      stat_plot_height_h,
+      stat_plot_height_h,
+      stat_plot_height_m
+    )
+  )
+  
+  return(df_out)
+}
+
+stat_plot_graph_box_area <- function(stat_plot_avg, stat_plot_dev, index) {
+  
+  stat_plot_width_l <- 0.5 - stat_plot_width / 2
+  stat_plot_width_h <- 0.5 + stat_plot_width / 2
+  
+  stat_plot_height_l <- stat_plot_avg - stat_plot_dev
+  stat_plot_height_h <- stat_plot_avg + stat_plot_dev
+  
+  df_out <- tibble(
+    xpath = c(
+      index + stat_plot_width_l,
+      index + stat_plot_width_h
+    ),
+    ypath_l = c(
+      stat_plot_height_l,
+      stat_plot_height_l
+    ),
+    ypath_h = c(
+      stat_plot_height_h,
+      stat_plot_height_h
+    )
+  )
+  
+  return(df_out)
+}
+
+
+stat_plot_width_l <- 0.5 - stat_plot_width / 2
+stat_plot_width_h <- 0.5 + stat_plot_width / 2
+
+
+df_stat_plot_data_al <- df_joined_data %>%
+  transmute(y = chl_a, yh = chl_a_sat) %>%
+  filter(!is.na(y), !is.na(yh))
+
+df_stat_plot_data_10 <- df_joined_data %>%
+  filter(actual_depth <= -10) %>%
+  transmute(y = chl_a, yh = chl_a_sat) %>%
+  filter(!is.na(y), !is.na(yh))
+
+df_stat_plot_data_20 <- df_joined_data %>%
+  filter(actual_depth <= -20) %>%
+  transmute(y = chl_a, yh = chl_a_sat) %>%
+  filter(!is.na(y), !is.na(yh))
+
+
+
+
+# MAE
+
+vec_stat_plot_MAE_al <- abs(df_stat_plot_data_al$y - df_stat_plot_data_al$yh)
+
+vec_stat_plot_MAE_10 <- abs(df_stat_plot_data_10$y - df_stat_plot_data_10$yh)
+
+vec_stat_plot_MAE_20 <- abs(df_stat_plot_data_20$y - df_stat_plot_data_20$yh)
+
+
+stat_plot_MAE_al_avg <- sum(vec_stat_plot_MAE_al) / length(vec_stat_plot_MAE_al)
+stat_plot_MAE_al_dev <- sd(vec_stat_plot_MAE_al)
+
+stat_plot_MAE_10_avg <- sum(vec_stat_plot_MAE_10) / length(vec_stat_plot_MAE_10)
+stat_plot_MAE_10_dev <- sd(vec_stat_plot_MAE_10)
+
+stat_plot_MAE_20_avg <- sum(vec_stat_plot_MAE_20) / length(vec_stat_plot_MAE_20)
+stat_plot_MAE_20_dev <- sd(vec_stat_plot_MAE_20)
+
+
+df_stat_plot_MAE_al_box_path <- stat_plot_graph_box_path(stat_plot_MAE_al_avg, stat_plot_MAE_al_dev, 0)
+df_stat_plot_MAE_al_box_area <- stat_plot_graph_box_area(stat_plot_MAE_al_avg, stat_plot_MAE_al_dev, 0)
+
+df_stat_plot_MAE_10_box_path <- stat_plot_graph_box_path(stat_plot_MAE_10_avg, stat_plot_MAE_10_dev, 1)
+df_stat_plot_MAE_10_box_area <- stat_plot_graph_box_area(stat_plot_MAE_10_avg, stat_plot_MAE_10_dev, 1)
+
+df_stat_plot_MAE_20_box_path <- stat_plot_graph_box_path(stat_plot_MAE_20_avg, stat_plot_MAE_20_dev, 2)
+df_stat_plot_MAE_20_box_area <- stat_plot_graph_box_area(stat_plot_MAE_20_avg, stat_plot_MAE_20_dev, 2)
+
+stat_plot_MAE_max_y <- max(
+  stat_plot_MAE_al_avg + 1.5 * stat_plot_MAE_al_dev,
+  stat_plot_MAE_10_avg + 1.5 * stat_plot_MAE_10_dev,
+  stat_plot_MAE_20_avg + 1.5 * stat_plot_MAE_20_dev
+)
+
+stat_plot_MAE_min_y <- min(
+  0,
+  stat_plot_MAE_al_avg - 1.2 * stat_plot_MAE_al_dev,
+  stat_plot_MAE_10_avg - 1.2 * stat_plot_MAE_10_dev,
+  stat_plot_MAE_20_avg - 1.2 * stat_plot_MAE_20_dev
+)
+
+pdf("out/graphics/boxplots/boxplot_MAE.pdf") # COMMENT OUT
+
+ggplot() +
+  geom_abline(slope = 0, intercept = 0) + 
+  geom_ribbon(data = df_stat_plot_MAE_al_box_area, aes(x = xpath, ymin = ypath_l, ymax = ypath_h)) +
+  geom_path(data = df_stat_plot_MAE_al_box_path, aes(x = xpath, y = ypath)) + 
+  geom_ribbon(data = df_stat_plot_MAE_10_box_area, aes(x = xpath, ymin = ypath_l, ymax = ypath_h)) +
+  geom_path(data = df_stat_plot_MAE_10_box_path, aes(x = xpath, y = ypath)) + 
+  geom_ribbon(data = df_stat_plot_MAE_20_box_area, aes(x = xpath, ymin = ypath_l, ymax = ypath_h)) +
+  geom_path(data = df_stat_plot_MAE_20_box_path, aes(x = xpath, y = ypath)) + 
+  coord_cartesian(xlim = c(0, 3), ylim = c(stat_plot_MAE_min_y, stat_plot_MAE_max_y)) +
+  #geom_text(data = df_text, aes(x, y, label = text)) +
+  xlab("Omejitev globine morskega dna") + 
+  ylab(TeX("Koncentracija klorofila \\[\\mu g/l]"))
+  
+dev.off() # COMMENT OUT
+
+
+
+# MAE (log)
+
+
+
+vec_stat_plot_MAE_ln_al <- abs(log(df_stat_plot_data_al$y) - log(df_stat_plot_data_al$yh))
+
+vec_stat_plot_MAE_ln_10 <- abs(log(df_stat_plot_data_10$y) - log(df_stat_plot_data_10$yh))
+
+vec_stat_plot_MAE_ln_20 <- abs(log(df_stat_plot_data_20$y) - log(df_stat_plot_data_20$yh))
+
+
+stat_plot_MAE_ln_al_avg <- sum(vec_stat_plot_MAE_ln_al) / length(vec_stat_plot_MAE_ln_al)
+stat_plot_MAE_ln_al_dev <- sd(vec_stat_plot_MAE_ln_al)
+
+stat_plot_MAE_ln_10_avg <- sum(vec_stat_plot_MAE_ln_10) / length(vec_stat_plot_MAE_ln_10)
+stat_plot_MAE_ln_10_dev <- sd(vec_stat_plot_MAE_ln_10)
+
+stat_plot_MAE_ln_20_avg <- sum(vec_stat_plot_MAE_ln_20) / length(vec_stat_plot_MAE_ln_20)
+stat_plot_MAE_ln_20_dev <- sd(vec_stat_plot_MAE_ln_20)
+
+
+df_stat_plot_MAE_ln_al_box_path <- stat_plot_graph_box_path(stat_plot_MAE_ln_al_avg, stat_plot_MAE_ln_al_dev, 0)
+df_stat_plot_MAE_ln_al_box_area <- stat_plot_graph_box_area(stat_plot_MAE_ln_al_avg, stat_plot_MAE_ln_al_dev, 0)
+
+df_stat_plot_MAE_ln_10_box_path <- stat_plot_graph_box_path(stat_plot_MAE_ln_10_avg, stat_plot_MAE_ln_10_dev, 1)
+df_stat_plot_MAE_ln_10_box_area <- stat_plot_graph_box_area(stat_plot_MAE_ln_10_avg, stat_plot_MAE_ln_10_dev, 1)
+
+df_stat_plot_MAE_ln_20_box_path <- stat_plot_graph_box_path(stat_plot_MAE_ln_20_avg, stat_plot_MAE_ln_20_dev, 2)
+df_stat_plot_MAE_ln_20_box_area <- stat_plot_graph_box_area(stat_plot_MAE_ln_20_avg, stat_plot_MAE_ln_20_dev, 2)
+
+stat_plot_MAE_ln_max_y <- max(
+  stat_plot_MAE_ln_al_avg + 1.5 * stat_plot_MAE_ln_al_dev,
+  stat_plot_MAE_ln_10_avg + 1.5 * stat_plot_MAE_ln_10_dev,
+  stat_plot_MAE_ln_20_avg + 1.5 * stat_plot_MAE_ln_20_dev
+)
+
+stat_plot_MAE_ln_min_y <- min(
+  0,
+  stat_plot_MAE_ln_al_avg - 1.2 * stat_plot_MAE_ln_al_dev,
+  stat_plot_MAE_ln_10_avg - 1.2 * stat_plot_MAE_ln_10_dev,
+  stat_plot_MAE_ln_20_avg - 1.2 * stat_plot_MAE_ln_20_dev
+)
+
+pdf("out/graphics/boxplots/boxplot_MAE_ln.pdf") # COMMENT OUT
+
+ggplot() +
+  geom_abline(slope = 0, intercept = 0) + 
+  geom_ribbon(data = df_stat_plot_MAE_ln_al_box_area, aes(x = xpath, ymin = ypath_l, ymax = ypath_h)) +
+  geom_path(data = df_stat_plot_MAE_ln_al_box_path, aes(x = xpath, y = ypath)) + 
+  geom_ribbon(data = df_stat_plot_MAE_ln_10_box_area, aes(x = xpath, ymin = ypath_l, ymax = ypath_h)) +
+  geom_path(data = df_stat_plot_MAE_ln_10_box_path, aes(x = xpath, y = ypath)) + 
+  geom_ribbon(data = df_stat_plot_MAE_ln_20_box_area, aes(x = xpath, ymin = ypath_l, ymax = ypath_h)) +
+  geom_path(data = df_stat_plot_MAE_ln_20_box_path, aes(x = xpath, y = ypath)) + 
+  coord_cartesian(xlim = c(0, 3), ylim = c(stat_plot_MAE_ln_min_y, stat_plot_MAE_ln_max_y)) +
+  #geom_text(data = df_text, aes(x, y, label = text)) +
+  xlab("Omejitev globine morskega dna") + 
+  ylab(TeX("Koncentracija klorofila \\[ln(\\mu g/l)]"))
+  
+dev.off() # COMMENT OUT
+
+
+
+# MSE
+
+
+
+vec_stat_plot_MSE_al <- (df_stat_plot_data_al$y - df_stat_plot_data_al$yh)^2
+
+vec_stat_plot_MSE_10 <- (df_stat_plot_data_10$y - df_stat_plot_data_10$yh)^2
+
+vec_stat_plot_MSE_20 <- (df_stat_plot_data_20$y - df_stat_plot_data_20$yh)^2
+
+
+stat_plot_MSE_al_avg <- sum(vec_stat_plot_MSE_al) / length(vec_stat_plot_MSE_al)
+stat_plot_MSE_al_dev <- sd(vec_stat_plot_MSE_al)
+
+stat_plot_MSE_10_avg <- sum(vec_stat_plot_MSE_10) / length(vec_stat_plot_MSE_10)
+stat_plot_MSE_10_dev <- sd(vec_stat_plot_MSE_10)
+
+stat_plot_MSE_20_avg <- sum(vec_stat_plot_MSE_20) / length(vec_stat_plot_MSE_20)
+stat_plot_MSE_20_dev <- sd(vec_stat_plot_MSE_20)
+
+
+df_stat_plot_MSE_al_box_path <- stat_plot_graph_box_path(stat_plot_MSE_al_avg, stat_plot_MSE_al_dev, 0)
+df_stat_plot_MSE_al_box_area <- stat_plot_graph_box_area(stat_plot_MSE_al_avg, stat_plot_MSE_al_dev, 0)
+
+df_stat_plot_MSE_10_box_path <- stat_plot_graph_box_path(stat_plot_MSE_10_avg, stat_plot_MSE_10_dev, 1)
+df_stat_plot_MSE_10_box_area <- stat_plot_graph_box_area(stat_plot_MSE_10_avg, stat_plot_MSE_10_dev, 1)
+
+df_stat_plot_MSE_20_box_path <- stat_plot_graph_box_path(stat_plot_MSE_20_avg, stat_plot_MSE_20_dev, 2)
+df_stat_plot_MSE_20_box_area <- stat_plot_graph_box_area(stat_plot_MSE_20_avg, stat_plot_MSE_20_dev, 2)
+
+stat_plot_MSE_max_y <- max(
+  stat_plot_MSE_al_avg + 1.5 * stat_plot_MSE_al_dev,
+  stat_plot_MSE_10_avg + 1.5 * stat_plot_MSE_10_dev,
+  stat_plot_MSE_20_avg + 1.5 * stat_plot_MSE_20_dev
+)
+
+stat_plot_MSE_min_y <- min(
+  0,
+  stat_plot_MSE_al_avg - 1.2 * stat_plot_MSE_al_dev,
+  stat_plot_MSE_10_avg - 1.2 * stat_plot_MSE_10_dev,
+  stat_plot_MSE_20_avg - 1.2 * stat_plot_MSE_20_dev
+)
+
+pdf("out/graphics/boxplots/boxplot_MSE.pdf") # COMMENT OUT
+
+ggplot() +
+  geom_abline(slope = 0, intercept = 0) + 
+  geom_ribbon(data = df_stat_plot_MSE_al_box_area, aes(x = xpath, ymin = ypath_l, ymax = ypath_h)) +
+  geom_path(data = df_stat_plot_MSE_al_box_path, aes(x = xpath, y = ypath)) + 
+  geom_ribbon(data = df_stat_plot_MSE_10_box_area, aes(x = xpath, ymin = ypath_l, ymax = ypath_h)) +
+  geom_path(data = df_stat_plot_MSE_10_box_path, aes(x = xpath, y = ypath)) + 
+  geom_ribbon(data = df_stat_plot_MSE_20_box_area, aes(x = xpath, ymin = ypath_l, ymax = ypath_h)) +
+  geom_path(data = df_stat_plot_MSE_20_box_path, aes(x = xpath, y = ypath)) + 
+  coord_cartesian(xlim = c(0, 3), ylim = c(stat_plot_MSE_min_y, stat_plot_MSE_max_y)) +
+  #geom_text(data = df_text, aes(x, y, label = text)) +
+  xlab("Omejitev globine morskega dna") + 
+  ylab(TeX("Koncentracija klorofila \\[(\\mu g/l)^2]"))
+  
+dev.off() # COMMENT OUT
+
+
+
+# MSE (log)
+
+
+
+vec_stat_plot_MSE_ln_al <- (log(df_stat_plot_data_al$y) - log(df_stat_plot_data_al$yh))^2
+
+vec_stat_plot_MSE_ln_10 <- (log(df_stat_plot_data_10$y) - log(df_stat_plot_data_10$yh))^2
+
+vec_stat_plot_MSE_ln_20 <- (log(df_stat_plot_data_20$y) - log(df_stat_plot_data_20$yh))^2
+
+
+stat_plot_MSE_ln_al_avg <- sum(vec_stat_plot_MSE_ln_al) / length(vec_stat_plot_MSE_ln_al)
+stat_plot_MSE_ln_al_dev <- sd(vec_stat_plot_MSE_ln_al)
+
+stat_plot_MSE_ln_10_avg <- sum(vec_stat_plot_MSE_ln_10) / length(vec_stat_plot_MSE_ln_10)
+stat_plot_MSE_ln_10_dev <- sd(vec_stat_plot_MSE_ln_10)
+
+stat_plot_MSE_ln_20_avg <- sum(vec_stat_plot_MSE_ln_20) / length(vec_stat_plot_MSE_ln_20)
+stat_plot_MSE_ln_20_dev <- sd(vec_stat_plot_MSE_ln_20)
+
+
+df_stat_plot_MSE_ln_al_box_path <- stat_plot_graph_box_path(stat_plot_MSE_ln_al_avg, stat_plot_MSE_ln_al_dev, 0)
+df_stat_plot_MSE_ln_al_box_area <- stat_plot_graph_box_area(stat_plot_MSE_ln_al_avg, stat_plot_MSE_ln_al_dev, 0)
+
+df_stat_plot_MSE_ln_10_box_path <- stat_plot_graph_box_path(stat_plot_MSE_ln_10_avg, stat_plot_MSE_ln_10_dev, 1)
+df_stat_plot_MSE_ln_10_box_area <- stat_plot_graph_box_area(stat_plot_MSE_ln_10_avg, stat_plot_MSE_ln_10_dev, 1)
+
+df_stat_plot_MSE_ln_20_box_path <- stat_plot_graph_box_path(stat_plot_MSE_ln_20_avg, stat_plot_MSE_ln_20_dev, 2)
+df_stat_plot_MSE_ln_20_box_area <- stat_plot_graph_box_area(stat_plot_MSE_ln_20_avg, stat_plot_MSE_ln_20_dev, 2)
+
+stat_plot_MSE_ln_max_y <- max(
+  stat_plot_MSE_ln_al_avg + 1.5 * stat_plot_MSE_ln_al_dev,
+  stat_plot_MSE_ln_10_avg + 1.5 * stat_plot_MSE_ln_10_dev,
+  stat_plot_MSE_ln_20_avg + 1.5 * stat_plot_MSE_ln_20_dev
+)
+
+stat_plot_MSE_ln_min_y <- min(
+  0,
+  stat_plot_MSE_ln_al_avg - 1.2 * stat_plot_MSE_ln_al_dev,
+  stat_plot_MSE_ln_10_avg - 1.2 * stat_plot_MSE_ln_10_dev,
+  stat_plot_MSE_ln_20_avg - 1.2 * stat_plot_MSE_ln_20_dev
+)
+
+pdf("out/graphics/boxplots/boxplot_MSE_ln.pdf") # COMMENT OUT
+
+ggplot() +
+  geom_abline(slope = 0, intercept = 0) + 
+  geom_ribbon(data = df_stat_plot_MSE_ln_al_box_area, aes(x = xpath, ymin = ypath_l, ymax = ypath_h)) +
+  geom_path(data = df_stat_plot_MSE_ln_al_box_path, aes(x = xpath, y = ypath)) + 
+  geom_ribbon(data = df_stat_plot_MSE_ln_10_box_area, aes(x = xpath, ymin = ypath_l, ymax = ypath_h)) +
+  geom_path(data = df_stat_plot_MSE_ln_10_box_path, aes(x = xpath, y = ypath)) + 
+  geom_ribbon(data = df_stat_plot_MSE_ln_20_box_area, aes(x = xpath, ymin = ypath_l, ymax = ypath_h)) +
+  geom_path(data = df_stat_plot_MSE_ln_20_box_path, aes(x = xpath, y = ypath)) + 
+  coord_cartesian(xlim = c(0, 3), ylim = c(stat_plot_MSE_ln_min_y, stat_plot_MSE_ln_max_y)) +
+  #geom_text(data = df_text, aes(x, y, label = text)) +
+  xlab("Omejitev globine morskega dna") + 
+  ylab(TeX("Koncentracija klorofila \\[ln((\\mu g/l)^2)]"))
+  
+dev.off() # COMMENT OUT
+
+```
+
