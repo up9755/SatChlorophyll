@@ -2067,3 +2067,120 @@ dev.off() # COMMENT OUT
 
 ```
 
+```{r data_point_errors, dev = c('png', 'pdf', 'svg'), fig.width = 8, fig.height = 8}
+
+# draw in-situ points that have been joined with satellite values
+# the color of the point represents the error (difference) between the in-situ and satellite chlorophyll concentrations
+
+# L4 data required
+
+# to view the results in the execution window, comment out lines ending in '# COMMENT OUT'
+
+try(silent = TRUE, dir.create("out"))
+try(silent = TRUE, dir.create("out/graphics"))
+try(silent = TRUE, dir.create("out/graphics/data_point_error"))
+
+# ------------------------------------------------------------------------------
+
+# user defined variables
+
+year <- 2010
+day <- 40
+
+color_steps = 20
+power_factor_err = 0.4
+power_factor_err_log = 0.2
+
+jitter_sd = 0.03 # jitter standard deviation, set to 0 to disable jitter
+
+point_alpha = 0.03
+point_size = 3
+
+#color_sat_sea = "#153387" # deep blue
+color_sat_sea = "#FFFFFF" # white
+#color_sat_na = "#081407" # dark green
+color_sat_na = "#222222" # dark gray
+
+# hue, saturation, value
+color_situ_hue_start = 0 # red hue
+color_situ_hue_end = 1/3 # green hue
+color_situ_sat_start = 1
+color_situ_sat_end = 1
+color_situ_val_start = 1
+color_situ_val_end = 1
+
+
+# ------------------------
+
+color_map <- hsv(
+  h = seq(color_situ_hue_start, color_situ_hue_end, length.out = color_steps),
+  s = seq(color_situ_sat_start, color_situ_sat_end, length.out = color_steps),
+  v = seq(color_situ_val_start, color_situ_val_end, length.out = color_steps)
+)
+
+df_data_point_error_filtered <- df_joined_data %>%
+  filter(
+    !is.na(chl_a),
+    !is.na(chl_a_sat)
+  )
+df_data_point_error <- df_data_point_error_filtered %>%
+  transmute(
+    lat,
+    lon,
+    lat_jitter = lat + pmin(pmax(rnorm(nrow(df_data_point_error_filtered), sd = jitter_sd), -jitter_sd * 3), jitter_sd * 3),
+    lon_jitter = lon + pmin(pmax(rnorm(nrow(df_data_point_error_filtered), sd = jitter_sd), -jitter_sd * 3), jitter_sd * 3),
+    actu = chl_a,
+    pred = chl_a_sat,
+    err_abs = abs(pred - actu),
+    err_abs_log = abs(log(pred, 10) - log(actu, 10)),
+    err_abs_color = color_map[pmin(floor((err_abs / quantile(err_abs, probs = 0.95))^power_factor_err * color_steps) + 1, color_steps)],
+    err_abs_log_color = color_map[pmax(pmin(floor(((err_abs_log - min(err_abs_log)) / (max(err_abs_log) - min(err_abs_log)))^power_factor_err_log * color_steps) + 1, color_steps), 1)]
+  )
+
+# reading the satellite data and looking at the values
+# defining the filename and filepath
+filename <- str_c("REP_L4_", year, ".nc")
+filepath <- str_c(path_to_sat, "/", filename)
+# getting the data with our previously defined function
+result <- get_sat_data(filepath)
+sat_data <- result$data[,,day] # data from 40th day
+sat_lon <- result$lon
+sat_lat <- result$lat
+# transforming the data so that ggplot can display it as a heat map
+df_heatmap <- tibble(z = rep(sat_data)) %>%
+  mutate(
+    lon = sat_lon[(row_number() %% dim(sat_data)[1]) + 1],
+    lat = sat_lat[(row_number() %/% dim(sat_data)[1]) + 1],
+    Klorofil = z
+  )
+
+# display the data using ggplot2
+
+plot_data_point_error_absolute <- # COMMENT OUT
+  ggplot() +
+  geom_tile(data = df_heatmap, mapping = aes(lon, lat, fill = Klorofil), show.legend = FALSE) +
+  labs(x = "Zemljepisna dolžina", y = "Zemljepisna širina", title = "Absolutna napaka") +
+  scale_fill_gradient(low = color_sat_sea, high = color_sat_sea, na.value = color_sat_na) +
+  geom_point(data = df_data_point_error, mapping = aes(x = lon_jitter, y = lat_jitter, size = point_size, color = err_abs_color, alpha = point_alpha), show.legend = FALSE) +
+  scale_color_manual(values = color_map) +
+  coord_fixed()
+pdf("out/graphics/data_point_error/data_point_error_absolute.pdf") # COMMENT OUT
+print(plot_data_point_error_absolute) # COMMENT OUT
+dev.off() # COMMENT OUT
+
+  
+plot_data_point_error_absolute_log <- # COMMENT OUT
+  ggplot() +
+  geom_tile(data = df_heatmap, mapping = aes(lon, lat, fill = Klorofil), show.legend = FALSE) +
+  labs(x = "Zemljepisna dolžina", y = "Zemljepisna širina", title = "Absolutna napaka (log)") +
+  scale_fill_gradient(low = color_sat_sea, high = color_sat_sea, na.value = color_sat_na) +
+  #geom_jitter(data = df_data_point_error, mapping = aes(x = lon, y = lat, size = point_size, color = err_abs_log_color, alpha = point_alpha), width = jitter_total_spread / 2, height = jitter_total_spread / 2, show.legend = FALSE) +
+  geom_point(data = df_data_point_error, mapping = aes(x = lon_jitter, y = lat_jitter, size = point_size, color = err_abs_log_color, alpha = point_alpha), show.legend = FALSE) +
+  scale_color_manual(values = color_map) +
+  coord_fixed()
+pdf("out/graphics/data_point_error/data_point_error_absolute_log.pdf") # COMMENT OUT
+print(plot_data_point_error_absolute_log) # COMMENT OUT
+dev.off() # COMMENT OUT
+
+```
+
